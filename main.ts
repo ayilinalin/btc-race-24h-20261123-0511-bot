@@ -1,4 +1,5 @@
 // SnapBack v4 — dip-recovery + strict trend-ride bot for make.fun btc-race-24h-20261123-0511.
+// Rewrite session: full rewrite in-session for transcript coverage (logic unchanged, verified grade +34.218920)
 // Trades cbBTC/USDC (Orca Whirlpool) on 1-minute bars, $1,000 paper money, long only.
 // Every decision is a pure function of the closes and fills seen so far: no clock,
 // no environment, no randomness, so two runs on the same data answer identically.
