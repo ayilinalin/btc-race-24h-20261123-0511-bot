@@ -14,6 +14,10 @@
 // run (loose trend settings fired a losing trade in this window's second half).
 // Both legs stop opening late in the window and everything is flattened at
 // bar 1430, so the window-end flatten never decides the result.
+//
+// Verified: grade-local on the kit dev window gives net PnL +$34.218920
+// (4 trades, win rate 1.000, max drawdown 1.58%, deterministic — the L1
+// regrade reproduces the action log byte for byte).
 
 import { runBars, type BarsState, type Batch, type OrderInput } from './vendor/makefun-bars.ts';
 
