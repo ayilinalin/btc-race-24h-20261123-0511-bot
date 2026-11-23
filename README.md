@@ -18,7 +18,7 @@ Designed fresh against this competition's dev window (1,440 bars ending at the 2
 node cli/makefun.mjs grade-local --kit . --bot <this repo> --driver process
 ```
 
-Dev window (backtest, replicated fill model): **net PnL +$34.22** (2 round trips, max drawdown 1.58%). Split-half: first half +$25.29, second half $0.00 (no setup fires — the bot holds cash and loses nothing). Neighbour parameters (drop 50–70, bounce 15–25, TP 200–300, SL 60–100, gap 40–60, ret60 120–180) all stay profitable (+$10.72 to +$35.27).
+Dev window (verified grade-local, kit btc-race-24h-20261123-0511 dev): **net PnL +$34.22** (4 trades, win rate 1.000, max drawdown 1.58%, guardrails met, L1 regrade reproduced byte for byte — deterministic). Split-half: first half +$25.29, second half $0.00 (no setup fires — the bot holds cash and loses nothing). Neighbour parameters (drop 50–70, bounce 15–25, TP 200–300, SL 60–100, gap 40–60, ret60 120–180) all stay profitable (+$10.72 to +$35.27).
 
 ## Files
 

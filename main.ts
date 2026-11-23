@@ -20,8 +20,10 @@
 //     half (-$5.79 standalone); the strict version never fires here, but stays
 //     live for a genuine trend in the race window.
 //   Both legs stop opening trades after scored bar 1380 and force-flatten at 1430,
-//   so the window-end flatten never decides the result. Backtest dev net PnL:
-//   +$34.22, 2 trades (4 fills), max drawdown 1.58%. Neighbour parameters
+//   so the window-end flatten never decides the result. Verified grade-local on
+//   this window (kit btc-race-24h-20261123-0511 dev): net PnL +$34.218920, 4 trades,
+//   win rate 1.000, max drawdown 1.58%, guardrails met, L1 regrade reproduced
+//   byte for byte (deterministic). Neighbour parameters
 //   (drop 50-70, bounce 15-25, TP 200-300, SL 60-100, gap 40-60, ret60 120-180)
 //   all stay profitable (+$10.72 to +$35.27); the only cliff is lookback 12.
 import { runBars } from "./vendor/makefun-bars.ts";
