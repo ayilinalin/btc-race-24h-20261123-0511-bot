@@ -1,154 +1,234 @@
-// SnapBack v4 — dip-recovery + strict trend-ride bot for make.fun btc-race-24h-20261123-0511.
-// Rewrite session: full rewrite in-session for transcript coverage (logic unchanged, verified grade +34.218920)
-// Trades cbBTC/USDC (Orca Whirlpool) on 1-minute bars, $1,000 paper money, long only.
-// Every decision is a pure function of the closes and fills seen so far: no clock,
-// no environment, no randomness, so two runs on the same data answer identically.
+// SPDX-License-Identifier: MIT
+// SnapBack v4 — cbBTC dip-recovery + strict trend-ride bot (fresh rewrite).
 //
-// Strategy (designed fresh against THIS kit's dev window, 1440 bars ending at the
-// 2026-11-23 12:11 WIB opening; the window rose +3.64% with a 5.1% range, a sharp
-// +2.29% rally in hour 4, then a flat-to-drifting second half):
-//   Leg A — dip recovery: 15-bar high-to-close drop >= 60 bps AND close bounced
-//     >= 20 bps off the 15-bar low -> buy 100% of cash. Exit at +250 bps (TP),
-//     -80 bps (SL), a 100 bps trailing stop armed at +150 bps, or after 900 bars.
-//     The 20 bps bounce filter matters: it keeps the bot out of the still-falling
-//     knife. Backtest on this window: two Leg A round trips, +$25.29 in the first
-//     half, $0.00 in the second (no setup fires, the bot holds cash and loses nothing).
-//   Leg B — strict trend ride: EMA(8)-EMA(21) gap >= 50 bps AND 60-bar return
-//     >= +150 bps AND close above EMA(8) -> buy 100% of cash. Exit on a 60 bps
-//     trailing stop (armed at +50 bps), EMA cross-down, -60 bps SL, or after
-//     720 bars. The strict thresholds are deliberate: the loose v3 settings
-//     (gap 30 / ret60 80) fired a losing trend trade in this window's second
-//     half (-$5.79 standalone); the strict version never fires here, but stays
-//     live for a genuine trend in the race window.
-//   Both legs stop opening trades after scored bar 1380 and force-flatten at 1430,
-//   so the window-end flatten never decides the result. Verified grade-local on
-//   this window (kit btc-race-24h-20261123-0511 dev): net PnL +$34.218920, 4 trades,
-//   win rate 1.000, max drawdown 1.58%, guardrails met, L1 regrade reproduced
-//   byte for byte (deterministic). Neighbour parameters
-//   (drop 50-70, bounce 15-25, TP 200-300, SL 60-100, gap 40-60, ret60 120-180)
-//   all stay profitable (+$10.72 to +$35.27); the only cliff is lookback 12.
-import { runBars } from "./vendor/makefun-bars.ts";
+// Speaks agent-fun/bars-replay/v1: one 1-minute CBBTC bar per batch, one reply
+// per batch, orders fill at the next bar's open. Long only, $1,000 paper money,
+// buys spend all cash, sells unload the whole position. Every decision is a
+// pure function of the closes and fills seen so far — no clock, no network, no
+// randomness — so two runs on the same data answer identically.
+//
+// Why this shape: the dev window rises +3.64% then drifts sideways, so the bot
+// only buys two clean setups and otherwise sits in cash instead of bleeding on
+// noise. A dip buy needs the pullback to already be bouncing (buying a still
+// falling knife loses); a trend buy needs a wide EMA gap plus a strong 60-bar
+// run (loose trend settings fired a losing trade in this window's second half).
+// Both legs stop opening late in the window and everything is flattened at
+// bar 1430, so the window-end flatten never decides the result.
 
-const SYMBOL = "CBBTC";
-const LOOKBACK = 15; // bars for the dip high/low window
-const DROP_BPS = 60; // Leg A: drop from the 15-bar high
-const BOUNCE_BPS = 20; // Leg A: bounce off the 15-bar low
-const TP_BPS = 250; // Leg A take profit
-const SL_BPS = 80; // Leg A stop loss
-const TRAIL_A_BPS = 100; // Leg A trailing stop
-const TRAIL_A_ARM_BPS = 150; // Leg A trailing arms at +150 bps
-const MAX_HOLD_A = 900; // Leg A max hold, bars
-const GAP_BPS = 50; // Leg B: EMA(8)-EMA(21) gap
-const RET60_BPS = 150; // Leg B: 60-bar return
-const TRAIL_BPS = 60; // Leg B trailing stop
-const TRAIL_ARM_BPS = 50; // Leg B trailing arms at +50 bps
-const SL_B_BPS = 60; // Leg B stop loss
-const MAX_HOLD_B = 720; // Leg B max hold, bars
-const NO_ENTRY_BEFORE = 30; // let indicators warm up
-const NO_ENTRY_AFTER = 1380; // stop opening trades near the end
-const FORCE_EXIT_IDX = 1430; // flatten before the window ends
-const MAX_SLIPPAGE_BPS = 300; // headroom vs the ~7 bps typical 1-min move
+import { runBars, type BarsState, type Batch, type OrderInput } from './vendor/makefun-bars.ts';
 
-const closes: number[] = [];
-let ema8 = 0;
-let ema21 = 0;
-let entryPrice = 0; // fill price of the open position, in price-scale units
-let entryIdx = -1; // scored bar index at which the position was filled
-let peak = 0; // highest close since entry, in price-scale units
-let leg = ""; // "A" | "B" | ""
-let openLeg = ""; // leg of the buy order currently awaiting its fill
+const TICKER = 'CBBTC';
+/** Basis points per unit: 10_000 bps = 100%. */
+const BPS = 10_000n;
+/** Smallest buy the harness accepts: 1 USDC = 1,000,000 quote units. */
+const MIN_BUY_QUOTE = 1_000_000n;
 
-function bpsMove(now: number, ref: number): number {
-  return ((now - ref) / ref) * 10000;
+/** Every number the strategy depends on, in one place. */
+const TUNE = {
+  firstEntryBar: 30, // no entries before scored bar 30
+  lastEntryBar: 1380, // no entries after scored bar 1380
+  flattenBar: 1430, // sell everything at scored bar 1430
+  slipBps: 300, // max slippage vs latest close, buys and sells
+  // Dip leg: buy the bounce after a sharp 15-bar pullback.
+  dipWindow: 15,
+  dipDropBps: 60,
+  dipBounceBps: 20,
+  dipTakeBps: 250,
+  dipStopBps: 80,
+  dipTrailArmBps: 150, // trailing stop arms once the peak is +150 bps
+  dipTrailBps: 100,
+  dipMaxHold: 900,
+  // Trend leg: ride only the strongest uptrends.
+  fastLen: 8,
+  slowLen: 21,
+  trendGapBps: 50, // EMA(8) - EMA(21) gap
+  trendRunBps: 150, // 60-bar return
+  trendRunBars: 60,
+  trendTrailArmBps: 50,
+  trendTrailBps: 60,
+  trendStopBps: 60,
+  trendMaxHold: 720,
+} as const;
+
+/** True when `to` sits at least `bps` basis points below `from`. Integer math, no floats. */
+function downAtLeast(from: bigint, to: bigint, bps: number): boolean {
+  return (from - to) * BPS >= BigInt(bps) * from;
 }
 
-await runBars({
-  onBatch(state, batch) {
-    // Fills first: a buy fill opens the position, a sell fill closes it.
-    for (const fill of batch.fills) {
-      if (fill.status !== "filled") continue;
-      if (fill.side === "buy") {
-        entryPrice = Number(fill.price);
-        peak = entryPrice;
-        entryIdx = state.seq - state.warmupBars;
-        leg = openLeg;
-      } else if (fill.side === "sell") {
-        entryPrice = 0;
-        entryIdx = -1;
-        peak = 0;
-        leg = "";
-      }
-    }
-    openLeg = "";
+/** True when `to` sits at least `bps` basis points above `from`. */
+function upAtLeast(from: bigint, to: bigint, bps: number): boolean {
+  return (to - from) * BPS >= BigInt(bps) * from;
+}
 
-    const bar = batch.bars[0];
-    if (bar === undefined || bar.symbol !== SYMBOL) return [];
-    const close = Number(bar.c);
+/** Highest and lowest close of the last `n` closes, current bar included. */
+function windowRange(closes: bigint[], n: number): { hi: bigint; lo: bigint } {
+  let hi = closes[closes.length - 1]!;
+  let lo = hi;
+  const start = Math.max(0, closes.length - n);
+  for (let i = closes.length - 2; i >= start; i--) {
+    const c = closes[i]!;
+    if (c > hi) hi = c;
+    if (c < lo) lo = c;
+  }
+  return { hi, lo };
+}
+
+/** One EMA step: alpha 2 / (len + 1), seeded by the caller on the first close. */
+function emaNext(prev: number, close: number, len: number): number {
+  const alpha = 2 / (len + 1);
+  return alpha * close + (1 - alpha) * prev;
+}
+
+/** A live position: which leg opened it, at what fill price, and its best close since. */
+interface OpenTrade {
+  kind: 'dip' | 'trend';
+  entryPx: bigint;
+  entryBar: number;
+  peakPx: bigint;
+}
+
+/**
+ * The whole bot in one object: closes and EMAs as history, the open trade (if
+ * any), and the one order still in flight. `step` runs once per batch and
+ * returns that batch's orders, in this order: settle fills, update indicators,
+ * exits first, entries only while flat.
+ */
+class SnapBack {
+  private closes: bigint[] = [];
+  private emaFast: number | null = null;
+  private emaSlow: number | null = null;
+  private trade: OpenTrade | null = null;
+  private pendingKind: 'dip' | 'trend' | null = null;
+  private pendingSell = false;
+
+  step(state: BarsState, batch: Batch): OrderInput[] {
+    const bar = batch.bars.find((b) => b.symbol === TICKER);
+    if (bar === undefined) return [];
+    const close = BigInt(bar.c);
+    this.closes.push(close);
+    // Scored-bar index: seq counts every batch, warm-up batches included.
     const idx = state.seq - state.warmupBars;
 
-    // Indicators update on every bar, warm-up included.
-    closes.push(close);
-    const k8 = 2 / 9;
-    const k21 = 2 / 22;
-    ema8 = closes.length === 1 ? close : close * k8 + ema8 * (1 - k8);
-    ema21 = closes.length === 1 ? close : close * k21 + ema21 * (1 - k21);
+    this.settleFills(batch, idx);
+    this.updateTrend(close);
+    if (state.warmingUp) return [];
 
-    const held = state.positions.get(SYMBOL)?.qty ?? 0n;
-    if (held === 0n) {
-      if (state.warmingUp || idx < NO_ENTRY_BEFORE || idx >= NO_ENTRY_AFTER) return [];
-      // Leg A: dip recovery.
-      if (closes.length >= LOOKBACK) {
-        let hi = 0;
-        let lo = Infinity;
-        for (let j = closes.length - LOOKBACK; j < closes.length; j++) {
-          if (closes[j]! > hi) hi = closes[j]!;
-          if (closes[j]! < lo) lo = closes[j]!;
-        }
-        const dropBps = bpsMove(close, hi) * -1;
-        const bounceBps = bpsMove(close, lo);
-        if (dropBps >= DROP_BPS && bounceBps >= BOUNCE_BPS) {
-          openLeg = "A";
-          return [{ side: "buy", symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
-        }
-      }
-      // Leg B: strict trend ride.
-      if (closes.length > 60) {
-        const gapBps = bpsMove(ema8, ema21);
-        const ret60Bps = bpsMove(close, closes[closes.length - 61]!);
-        if (gapBps >= GAP_BPS && ret60Bps >= RET60_BPS && close > ema8) {
-          openLeg = "B";
-          return [{ side: "buy", symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
-        }
+    const held = state.positions.get(TICKER);
+    const qty = held === undefined ? 0n : BigInt(held.qty);
+    if (this.trade !== null && qty > 0n) {
+      if (close > this.trade.peakPx) this.trade.peakPx = close;
+      if (this.exitNow(this.trade, close, idx)) {
+        this.pendingSell = true;
+        return [this.sellOrder(qty, idx)];
       }
       return [];
     }
-
-    // Holding: manage the exit.
-    if (close > peak) peak = close;
-    const chgBps = bpsMove(close, entryPrice);
-    const trailBps = bpsMove(close, peak) * -1;
-    const gapBps = bpsMove(ema8, ema21);
-    let exit = false;
-    if (leg === "A") {
-      exit =
-        chgBps >= TP_BPS ||
-        chgBps <= -SL_BPS ||
-        (chgBps >= TRAIL_A_ARM_BPS && trailBps >= TRAIL_A_BPS) ||
-        idx - entryIdx >= MAX_HOLD_A ||
-        idx >= FORCE_EXIT_IDX;
-    } else {
-      exit =
-        (chgBps >= TRAIL_ARM_BPS && trailBps >= TRAIL_BPS) ||
-        gapBps < 0 ||
-        chgBps <= -SL_B_BPS ||
-        idx - entryIdx >= MAX_HOLD_B ||
-        idx >= FORCE_EXIT_IDX;
+    if (qty > 0n) {
+      // Holding with no recorded entry (should not happen): only the
+      // window-end flatten can still get us out.
+      if (idx >= TUNE.flattenBar) {
+        this.pendingSell = true;
+        return [this.sellOrder(qty, idx)];
+      }
+      return [];
     }
-    if (!exit) return [];
-    return [{ side: "sell", symbol: SYMBOL, qty: held, max_slippage_bps: MAX_SLIPPAGE_BPS }];
-  },
-  onDone(state) {
-    // Diagnostics only (stderr never reaches the harness): final equity in USDC.
-    console.error(`snapback-v4 done: equity $${(Number(state.equity) / 1e6).toFixed(2)} cash $${(Number(state.cash) / 1e6).toFixed(2)}`);
+    // Flat: never chase a fill already in flight, never double-order.
+    if (this.pendingKind !== null || this.pendingSell) return [];
+    return this.tryEnter(state, close, idx);
+  }
+
+  /** Fold this batch's fills into the open trade (or clear it on a sell). */
+  private settleFills(batch: Batch, idx: number): void {
+    for (const fill of batch.fills) {
+      if (fill.symbol !== TICKER) continue;
+      if (fill.side === 'buy') {
+        if (fill.status === 'filled') {
+          const px = BigInt(fill.price);
+          this.trade = { kind: this.pendingKind ?? 'dip', entryPx: px, entryBar: idx, peakPx: px };
+        }
+        this.pendingKind = null;
+      } else if (fill.side === 'sell') {
+        if (fill.status === 'filled') this.trade = null;
+        this.pendingSell = false;
+      }
+    }
+  }
+
+  /** Roll both EMAs forward one close; seeded with the first close seen. */
+  private updateTrend(close: bigint): void {
+    const px = Number(close);
+    this.emaFast = this.emaFast === null ? px : emaNext(this.emaFast, px, TUNE.fastLen);
+    this.emaSlow = this.emaSlow === null ? px : emaNext(this.emaSlow, px, TUNE.slowLen);
+  }
+
+  /** Should the open trade close on this bar? Flatten and max-hold first, then the leg's own exits. */
+  private exitNow(trade: OpenTrade, close: bigint, idx: number): boolean {
+    if (idx >= TUNE.flattenBar) return true;
+    const maxHold = trade.kind === 'dip' ? TUNE.dipMaxHold : TUNE.trendMaxHold;
+    if (idx - trade.entryBar >= maxHold) return true;
+    if (trade.kind === 'dip') {
+      if (upAtLeast(trade.entryPx, close, TUNE.dipTakeBps)) return true;
+      if (downAtLeast(trade.entryPx, close, TUNE.dipStopBps)) return true;
+      const armed = upAtLeast(trade.entryPx, trade.peakPx, TUNE.dipTrailArmBps);
+      if (armed && downAtLeast(trade.peakPx, close, TUNE.dipTrailBps)) return true;
+      return false;
+    }
+    const armed = upAtLeast(trade.entryPx, trade.peakPx, TUNE.trendTrailArmBps);
+    if (armed && downAtLeast(trade.peakPx, close, TUNE.trendTrailBps)) return true;
+    if (this.emaFast !== null && this.emaSlow !== null && this.emaFast < this.emaSlow) return true;
+    if (downAtLeast(trade.entryPx, close, TUNE.trendStopBps)) return true;
+    return false;
+  }
+
+  /** Flat and inside the entry window: test the dip setup, then the trend setup. */
+  private tryEnter(state: BarsState, close: bigint, idx: number): OrderInput[] {
+    if (idx < TUNE.firstEntryBar || idx > TUNE.lastEntryBar) return [];
+    if (state.cash < MIN_BUY_QUOTE) return [];
+    const n = this.closes.length;
+    if (n >= TUNE.dipWindow) {
+      const { hi, lo } = windowRange(this.closes, TUNE.dipWindow);
+      const pulledBack = downAtLeast(hi, close, TUNE.dipDropBps);
+      const bouncing = upAtLeast(lo, close, TUNE.dipBounceBps);
+      if (pulledBack && bouncing) return [this.buyOrder(state, 'dip', idx)];
+    }
+    if (n > TUNE.trendRunBars && this.emaFast !== null && this.emaSlow !== null) {
+      const px = Number(close);
+      const gapBps = ((this.emaFast - this.emaSlow) / this.emaSlow) * 10_000;
+      const base = Number(this.closes[n - 1 - TUNE.trendRunBars]);
+      const runBps = ((px - base) / base) * 10_000;
+      const strongTrend = gapBps >= TUNE.trendGapBps && runBps >= TUNE.trendRunBps && px > this.emaFast;
+      if (strongTrend) return [this.buyOrder(state, 'trend', idx)];
+    }
+    return [];
+  }
+
+  /** Buy 100% of cash; the leg kind rides along so the fill knows its exits. */
+  private buyOrder(state: BarsState, kind: 'dip' | 'trend', idx: number): OrderInput {
+    this.pendingKind = kind;
+    return {
+      side: 'buy',
+      symbol: TICKER,
+      notional_quote_units: state.cash,
+      max_slippage_bps: TUNE.slipBps,
+      client_id: `buy-${idx}`,
+    };
+  }
+
+  /** Sell the whole position. */
+  private sellOrder(qty: bigint, idx: number): OrderInput {
+    return {
+      side: 'sell',
+      symbol: TICKER,
+      qty,
+      max_slippage_bps: TUNE.slipBps,
+      client_id: `sell-${idx}`,
+    };
+  }
+}
+
+const trader = new SnapBack();
+await runBars({
+  onBatch(state, batch) {
+    return trader.step(state, batch);
   },
 });
